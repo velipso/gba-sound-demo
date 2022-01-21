@@ -10,15 +10,15 @@ a 32K sample rate.
 
 The source code is included, as .gvasm files.
 
-Read the [technical details](./main/technical-details.md) for more information on how this works.
+Read the [technical details](./technical-details.md) for more information on how this works.
 
 Playing the Demos
 -----------------
 
 The .gba files are in the repo, so you can download them directly:
 
-* [rates.gba](https://raw.githubusercontent.com/velipso/gba-sound-demo/main/rates.gba) ([source](./main/rates.gvasm))
-* [song.gba](https://raw.githubusercontent.com/velipso/gba-sound-demo/main/song.gba) ([source](./main/song.gvasm))
+* [rates.gba](https://raw.githubusercontent.com/velipso/gba-sound-demo/main/rates.gba) ([source](./rates.gvasm))
+* [song.gba](https://raw.githubusercontent.com/velipso/gba-sound-demo/main/song.gba) ([source](./song.gvasm))
 
 Both demos have a blinking indicator in the bottom left -- this is used to verify that timing is
 correct when using timer based sample rates (16K, 32K, 65K).  Blinking indicates that the VBlank
