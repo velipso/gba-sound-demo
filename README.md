@@ -9,6 +9,9 @@ The .gba files are in the repo, so you can download them directly:
 * [rates.gba](https://raw.githubusercontent.com/velipso/gba-sound-demo/main/rates.gba)
 * [song.gba](https://raw.githubusercontent.com/velipso/gba-sound-demo/main/song.gba)
 
+Rates Demo
+----------
+
 ![rates.gba](https://github.com/velipso/gba-sound-demo/raw/main/rates.png)
 
 The rates demo will play a tone, and allow you to switch the sample rate, bit depth, dithering,
@@ -20,6 +23,9 @@ Controls:
 * Select - set tone to 4096Hz
 * D-pad - change settings
 * A/B - change between top or bottom settings (for quick comparison)
+
+Song Demo
+---------
 
 ![song.gba](https://github.com/velipso/gba-sound-demo/raw/main/song.png)
 
