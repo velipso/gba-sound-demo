@@ -1,6 +1,15 @@
 GBA Sound Demo
 ==============
 
+These demos allow you to experiment with different sample rates and bit depths on the Gameboy
+Advance.
+
+The GBA is notorious for having bad sound.  Using these demos, you can verify that the GBA hardware
+is quite capable of good sound, but it takes special care to setup the timing correctly to produce
+a 32K sample rate.
+
+The source code is included, as .gvasm files.
+
 Playing the Demos
 -----------------
 
@@ -8,6 +17,10 @@ The .gba files are in the repo, so you can download them directly:
 
 * [rates.gba](https://raw.githubusercontent.com/velipso/gba-sound-demo/main/rates.gba)
 * [song.gba](https://raw.githubusercontent.com/velipso/gba-sound-demo/main/song.gba)
+
+Both demos have a blinking indicator in the bottom left -- this is used to verify that timing is
+correct when using timer based sample rates (16K, 32K, 65K).  Blinking indicates that the VBlank
+and Timer IRQ fired at the same exact time.
 
 Rates Demo
 ----------
@@ -18,6 +31,7 @@ The rates demo will play a tone, and allow you to switch the sample rate, bit de
 and hardware sample rate.
 
 Controls:
+
 * L/R - sweep tone
 * Start - set tone to 256Hz
 * Select - set tone to 4096Hz
@@ -33,6 +47,7 @@ The song demo will play a song at two sample rates -- the top is controlled via 
 is controlled via timers.
 
 Controls:
+
 * Start - restart song
 * Anything else - swap between sample rates
 
