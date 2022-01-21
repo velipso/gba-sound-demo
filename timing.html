@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!--
+GBA Sound Demo
+by Sean Connelly (@velipso), https://sean.cm
+The Unlicense License
+Project Home: https://github.com/velipso/gba-sound-demo
+  -->
+  <title>GBA Timing</title>
+  <meta charset="utf-8" />
+  <style>
+body {
+  background-color: #212121;
+  color: #ddd;
+}
+canvas {
+  display: block;
+  margin: 8px auto;
+}
+button {
+  width: 80px;
+  font-size: 12pt;
+  font-family: monospace;
+}
+p {
+  text-align: center;
+}
+  </style>
+</head>
+<body>
+<p>
+  <button onclick="targetSampleRate = (1 << 24)/(0x10000 - 0xfb1a); labelRate = '13,378'; bufSize = 224; bufSum = Math.floor(vblankSum * bufSize / 280896);">13K</button>
+  <button onclick="targetSampleRate = 1 << 15; labelRate = '32,768'; bufSize = 608;">32K</button>
+  <button onclick="targetSampleRate = (1 << 24)/(0x10000 - 0xfe71); labelRate = '42,048'; bufSize = 704; bufSum = Math.floor(vblankSum * bufSize / 280896);">42K</button>
+  -
+  <button onclick="targetTimeMul = 1;">1x</button>
+  <button onclick="targetTimeMul = 2;">2x</button>
+  <button onclick="targetTimeMul = 20;">20x</button>
+  <button onclick="targetTimeMul = 100;">100x</button>
+  <button onclick="targetTimeMul = 300;">300x</button>
+  <button onclick="targetTimeMul = 1000;">1000x</button>
+  <button onclick="targetTimeMul = 16777;">Full</button>
+  -
+  <button onclick="viewAll = (viewAll + 1) % 4;" oncontextmenu="viewAll = (viewAll + 3) % 4; return false;">View</button>
+</p>
+<canvas id="cnv" width="2200" height="1220" style="width: 1100px; height: 610px;" />
+<script>
+var cnv = document.getElementById('cnv');
+var ctx = cnv.getContext('2d');
+ctx.lineCap = 'round';
+ctx.font = '30px monospace';
+ctx.textBaseline = 'middle';
+ctx.textAlign = 'center';
+ctx.setTransform(2, 0, 0, 2, -200, -256);
+
+function drawCircle(x, y, rad, done, line){
+  ctx.beginPath();
+  ctx.arc(x, y, rad, 0, Math.PI * 2);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 3;
+  ctx.globalAlpha = line ? Math.pow(Math.abs(0.5 - done) * 2, 10) : 0.25;
+  ctx.fillStyle = '#777';
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x, y - rad - 10);
+  ctx.lineTo(x, y - rad + 10);
+  ctx.stroke();
+  if (line){
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + Math.sin(Math.PI * 2 * done) * rad, y - Math.cos(Math.PI * 2 * done) * rad);
+    ctx.stroke();
+  }
+}
+
+var lastNow = Date.now();
+var sampleHold = 0;
+var soundoutHold = 0;
+var targetSampleRate = 1 << 15;
+var labelRate = '32,768';
+var sampleReset = Math.floor((1 << 24) / targetSampleRate);
+var vblankSum = 0;
+var sampleSum = 0;
+var soundoutSum = 0;
+var secondSum = 0;
+var timeMul = 1;
+var targetTimeMul = 1;
+var sampleHoldD = 1;
+var screenLines = [];
+var bufSize = 608;
+var bufSum = 0;
+var bufResetAt = 0;
+var bufResetDt = 0;
+var viewAll = 3;
+function redraw(){
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, cnv.width, cnv.height);
+  ctx.restore();
+  var now = Date.now();
+  var dt = now - lastNow;
+  lastNow = now;
+  bufResetDt += dt;
+
+  var targetTimeMulD = targetTimeMul - timeMul;
+  if (Math.abs(targetTimeMulD) > 50 && timeMul > 1000){
+    if (targetTimeMulD > 0)
+      timeMul += 50;
+    else
+      timeMul -= 50;
+  }
+  else if (Math.abs(targetTimeMulD) > 5){
+    if (targetTimeMulD > 0)
+      timeMul += 5;
+    else
+      timeMul -= 5;
+  }
+  else
+    timeMul = targetTimeMul;
+
+  for (var timeAgain = 0; timeAgain < timeMul; timeAgain++){
+    var targetSampleReset = Math.floor((1 << 24) / targetSampleRate);
+    var delta = targetSampleReset - sampleReset;
+    if (delta < -5)
+      delta = -5;
+    if (delta > 5)
+      delta = 5;
+    sampleReset += delta;
+
+    vblankSum = (vblankSum + dt) % 280896;
+    var vblank = vblankSum / 280896;
+
+    if (sampleSum + dt >= sampleReset){
+      sampleHold += sampleHoldD;
+      if (sampleHold >= 9)
+        sampleHoldD = -1;
+      if (sampleHold <= -9)
+        sampleHoldD = 1;
+      bufSum++;
+      if (bufSum >= bufSize){
+        bufResetAt = vblank;
+        bufResetDt = 0;
+        bufSum -= bufSize;
+      }
+    }
+    sampleSum = (sampleSum + dt) % sampleReset;
+    var sample = sampleSum / sampleReset;
+
+    if (soundoutSum + dt >= 512)
+      soundoutHold = sampleHold;
+    soundoutSum = (soundoutSum + dt) % 512;
+    var soundout = soundoutSum / 512;
+
+    secondSum = (secondSum + dt) % (1 << 24);
+    var second = secondSum / (1 << 24);
+  }
+
+  var scanline = Math.floor(((vblank + (160 / (160 + 68))) % 1) * (160 + 68));
+
+  if (viewAll === 3){
+    ctx.lineCap = 'butt';
+    for (var i = 0; i < 20; i++){
+      var sc = (scanline - i + 160 + 68) % (160 + 68);
+      ctx.globalAlpha = (20 - i) / 20;
+      ctx.beginPath();
+      ctx.moveTo(680, 130 + sc);
+      ctx.lineTo(920, 130 + sc);
+      ctx.strokeStyle = sc < 160 ? '#fff' : '#f73';
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(920, 130 + sc);
+      ctx.lineTo(920 + 240 * 228 / 1004, 130 + sc);
+      ctx.strokeStyle = '#73f';
+      ctx.stroke();
+    }
+    ctx.lineCap = 'round';
+
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.moveTo(680, 290);
+    ctx.lineTo(680, 290 + 68);
+    ctx.lineTo(920 + 240 * 228 / 1004, 290 + 68);
+    ctx.lineTo(920 + 240 * 228 / 1004, 130);
+    ctx.lineTo(920, 130);
+    ctx.strokeStyle = '#333';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.rect(680, 130, 240, 160);
+    ctx.strokeStyle = '#fff';
+    ctx.stroke();
+  }
+
+  drawCircle(1100, 200, 40, second, true);
+  if (viewAll >= 1){
+    if (viewAll >= 2 && bufResetDt < 1000){
+      ctx.beginPath();
+      var ang = Math.PI * 2 * bufResetAt;
+      ctx.moveTo(200, 400);
+      ctx.lineTo(
+        200 + 50 * Math.sin(ang),
+        400 - 50 * Math.cos(ang)
+      );
+      ctx.globalAlpha = (1000 - bufResetDt) / 1000;
+      ctx.strokeStyle = '#3f7';
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    drawCircle(200, 400, 50, vblank, timeMul <= 1000);
+  }
+  if (viewAll === 3)
+    drawCircle(550, 300, 50, (vblank + (160 / (160 + 68))) % 1, timeMul <= 1000);
+  drawCircle(550, 500, 50, sample, timeMul < 10);
+  drawCircle(800, 500, 50, soundout, timeMul < 10);
+
+  ctx.fillStyle = '#37f';
+  ctx.fillText('1', 1100, 270);
+  if (viewAll >= 1)
+    ctx.fillText('59.7', 200, 480);
+  if (viewAll === 3)
+    ctx.fillText('59.7', 550, 380);
+
+  ctx.globalAlpha = 0.2 + Math.pow(Math.abs(0.5 - sample) * 2, 5) * 0.8;
+  ctx.fillStyle = '#fff';
+  ctx.fillText((sampleHold >= 0 ? '+' : '') + sampleHold, 675, 500);
+  ctx.globalAlpha = 1;
+  ctx.save();
+  ctx.font = '20px monospace';
+  ctx.fillStyle = '#37f';
+  ctx.fillText('Hold', 675, 540);
+  ctx.restore();
+  ctx.fillStyle = '#3f7';
+  ctx.fillText('' + labelRate, 550, 580);
+
+  if (timeMul <= 20){
+    ctx.beginPath();
+    ctx.arc(950 + soundout * 30, 500, 5, 0, Math.PI * 2);
+    ctx.fillStyle = '#555';
+    ctx.fill();
+  }
+  else{
+    ctx.save();
+    ctx.strokeStyle = '#444';
+    ctx.lineWidth = 10;
+    ctx.beginPath();
+    ctx.moveTo(950, 500);
+    ctx.lineTo(980, 500);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.globalAlpha = 0.2 + Math.pow(Math.abs(0.5 - soundout) * 2, 5) * 0.8;
+  ctx.fillStyle = '#fff';
+  ctx.fillText((soundoutHold >= 0 ? '+' : '') + soundoutHold, 925, 500);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#37f';
+  ctx.fillText('32,768', 800, 580);
+
+  ctx.beginPath();
+  var sx = 990;
+  var sy = 500;
+  ctx.moveTo(sx, sy - 10);
+  ctx.lineTo(sx + 10, sy - 10);
+  ctx.lineTo(sx + 20, sy - 20);
+  ctx.lineTo(sx + 20, sy + 20);
+  ctx.lineTo(sx + 10, sy + 10);
+  ctx.lineTo(sx, sy + 10);
+  ctx.closePath();
+  ctx.stroke();
+
+  if (viewAll >= 1){
+    var yy = bufSize < 600 ? 460 : 425;
+    for (var y = 0; y < bufSize / 16; y++){
+      for (var x = 0; x < 16; x++){
+        ctx.beginPath();
+        ctx.arc(340 + x * 7, yy + y * 7, 3, 0, Math.PI * 2);
+        ctx.fillStyle = x + y * 16 < bufSum ? '#555' : '#3f7';
+        ctx.fill();
+      }
+    }
+  }
+
+  if (viewAll === 3){
+    ctx.beginPath();
+    ctx.rect(340, 150, 105, 250);
+    ctx.strokeStyle = '#fff';
+    for (var y = 185; y < 370; y += 30){
+      ctx.moveTo(360, y);
+      ctx.lineTo(425, y);
+    }
+    ctx.stroke();
+  }
+}
+
+setInterval(redraw, 0);
+
+</script>
+</body>
+</html>

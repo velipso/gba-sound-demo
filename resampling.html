@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <!--
+GBA Sound Demo
+by Sean Connelly (@velipso), https://sean.cm
+The Unlicense License
+Project Home: https://github.com/velipso/gba-sound-demo
+  -->
+  <title>GBA Resampling</title>
+  <meta charset="utf-8" />
+  <style>
+body {
+  background-color: #212121;
+  color: #ddd;
+}
+canvas {
+  display: block;
+  margin: 8px auto;
+}
+button {
+  font-size: 12pt;
+  font-family: monospace;
+}
+p {
+  text-align: center;
+}
+  </style>
+</head>
+<body>
+<p>
+  <button style="width: 40px;" onclick="view.sample = (view.sample + 1) % 4; redraw();" oncontextmenu="view.sample = (view.sample + 3) % 4; redraw(); return false;">G</button>
+  <button style="width: 40px;" onclick="view.sinc = (view.sinc + 1) % 4; redraw();" oncontextmenu="view.sinc = (view.sinc + 3) % 4; redraw(); return false;">I</button>
+  <button style="width: 80px;" id="wave" onclick="loadWave(1 - waveIndex);" oncontextmenu="return loadWave(1 - waveIndex);">Wave A</button>
+  -
+  <button style="width: 80px;" id="bit" onclick="nextBit(1);" oncontextmenu="return nextBit(-1);">8-Bit</button>
+  <button style="width: 80px;" id="rate" onclick="nextRate(1);" oncontextmenu="return nextRate(-1);">32kHz</button>
+  <button style="width: 160px;" id="dither" onclick="nextDither();" oncontextmenu="return nextDither();">Dither: Off</button>
+  <button style="width: 160px;" id="resample" onclick="nextResample();" oncontextmenu="return nextResample();">Resample: Off</button>
+  <button style="width: 160px;" disabled id="method" onclick="nextMethod();" oncontextmenu="return nextMethod();">Method: Hold</button>
+</p>
+<canvas id="cnv" width="2200" height="1220" style="width: 1100px; height: 610px;" />
+<script>
+var cnv = document.getElementById('cnv');
+var ctx = cnv.getContext('2d');
+ctx.translate(0, -30);
+ctx.font = '30px monospace';
+ctx.textBaseline = 'middle';
+ctx.textAlign = 'center';
+
+function crush(v, bitDepth, dithering){
+  var n = 1 << bitDepth;
+  v = Math.min(1, Math.max(-1, v)) * (n - 1) / 2 - 0.5;
+  if (!dithering)
+    return Math.round(v);
+  var i = Math.floor(v);
+  if (v - i > Math.random())
+    i++;
+  return i;
+}
+
+function generateSine(samples, bitDepth, dithering){
+  var out = [];
+  for (var i = 0; i < samples; i++)
+    out.push(crush(Math.sin((i + 0.5) * Math.PI * 5 / samples), bitDepth, dithering));
+  return out;
+}
+
+function newWave(samples, bitDepth){
+  return {
+    samples: generateSine(samples, bitDepth, false),
+    bitDepth: bitDepth,
+    dither: false,
+    resample: false,
+    method: 'Hold'
+  };
+}
+
+function sinc(x){
+  if (x === 0)
+    return 1;
+  x *= Math.PI;
+  return Math.sin(x) / x;
+}
+
+function $(id){
+  return document.getElementById(id);
+}
+
+function loadWave(i){
+  waveIndex = i;
+  var w = waves[i];
+  $('wave').innerText = (['Wave A', 'Wave B'])[i];
+  $('bit').innerText = w.bitDepth + '-Bit';
+  $('rate').innerText = Math.floor(w.samples.length / 10) + 'K';
+  $('dither').innerText = w.dither ? 'Dither: On\xa0' : 'Dither: Off';
+  $('resample').innerText = w.resample ? 'Resample: 32K' : 'Resample: Off';
+  $('method').disabled = !w.resample;
+  $('method').innerText = 'Method: ' + w.method;
+  redraw();
+  return false;
+}
+
+function nextBit(d){
+  var w = waves[waveIndex];
+  w.bitDepth = ((w.bitDepth + 8 + d) % 9) + 1;
+  w.samples = generateSine(w.samples.length, w.bitDepth, w.dither);
+  return loadWave(waveIndex);
+}
+
+function nextRate(d){
+  var w = waves[waveIndex];
+  var r = rates.findIndex(function(it){ return it === w.samples.length; });
+  w.samples = generateSine(rates[(r + rates.length + d) % rates.length], w.bitDepth, w.dither);
+  return loadWave(waveIndex);
+}
+
+function nextDither(){
+  var w = waves[waveIndex];
+  w.dither = !w.dither;
+  w.samples = generateSine(w.samples.length, w.bitDepth, w.dither);
+  return loadWave(waveIndex);
+}
+
+function nextResample(){
+  var w = waves[waveIndex];
+  w.resample = !w.resample;
+  return loadWave(waveIndex);
+}
+
+function nextMethod(){
+  var w = waves[waveIndex];
+  w.method = w.method === 'Hold' ? 'Sinc' : 'Hold';
+  return loadWave(waveIndex);
+}
+
+function getSamples(index){
+  var w = waves[index];
+  if (!w.resample)
+    return w.samples;
+  var out = [];
+  switch (w.method){
+    case 'Sinc':
+      for (var i = 0; i < 320; i++){
+        var v = 0;
+        for (var j = 0; j < w.samples.length; j++)
+          v += w.samples[j] * sinc(i * w.samples.length / 320 - j);
+        if (!w.dithering)
+          v = Math.round(v);
+        else{
+          var g = Math.floor(v);
+          if (v - g > Math.random())
+            g++;
+          v = g;
+        }
+        out.push(
+          Math.min(
+            (1 << (w.bitDepth - 1)) - 1,
+            Math.max(
+              -(1 << (w.bitDepth - 1)),
+              v
+            )
+          )
+        );
+      }
+      break;
+    case 'Hold':
+      for (var i = 0; i < 320; i++)
+        out.push(w.samples[Math.floor(i * w.samples.length / 320)]);
+      break;
+  }
+  return out;
+}
+
+var waves = [newWave(40, 4), newWave(320, 8)];
+var rates = [40, 80, 100, 130, 160, 210, 320, 420];
+var waveIndex = 0;
+var view = {
+  sample: 0,
+  sinc: 0
+};
+function redraw(){
+  ctx.clearRect(0, 0, cnv.width, cnv.height);
+  ctx.save();
+  var w = waves[waveIndex];
+  var w2 = waves[1 - waveIndex];
+  var wsamples = getSamples(waveIndex);
+  var padx = 60;
+  var pady = w.bitDepth === 9 ? 99 : 100;
+  var cw = (cnv.width - padx * 2) / wsamples.length;
+  var ch = (cnv.height - pady * 2) / ((1 << w.bitDepth) - 1);
+
+  // cells
+  if (view.sample === 0 || view.sample === 1){
+    for (var x = 0; x < wsamples.length; x++){
+      var v = wsamples[x];
+      var sx = Math.round(x * cw + padx);
+      var sw = Math.round((x + 1) * cw + padx) - sx;
+      var sh = (-0.5 - v) * (cnv.height - pady * 2) / ((1 << w.bitDepth) - 1);
+      ctx.fillStyle = '#0a0';
+      ctx.fillRect(sx, cnv.height / 2, sw, sh);
+    }
+  }
+
+  // grid
+  ctx.beginPath();
+  for (var x = 0; x <= wsamples.length; x++){
+    var sx = Math.round(x * cw + padx);
+    ctx.moveTo(sx, pady);
+    ctx.lineTo(sx, cnv.height - pady);
+  }
+  for (var y = 0; y <= (1 << w.bitDepth) - 1; y++){
+    var sy = Math.round(y * ch + pady);
+    if (w.bitDepth < 9 || (y % 2) === 0){
+      ctx.moveTo(padx - 10, sy);
+      ctx.lineTo(cnv.width - padx, sy);
+    }
+  }
+  if (w.bitDepth === 9){
+    // extra line at bottom for 9-bit
+    ctx.moveTo(padx - 0.5, 1122);
+    ctx.lineTo(cnv.width - padx + 0.5, 1122);
+  }
+  ctx.strokeStyle = '#555';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // bit depth label
+  for (var y = 0; y <= (1 << w.bitDepth) - 1; y++){
+    var sy = Math.round(y * ch + pady);
+    var label = (((1 << w.bitDepth) / 2) - y - 1);
+    if (w.bitDepth <= 5 ||
+      (Math.abs(label) % (1 << (w.bitDepth - 5))) === 0 ||
+      label === (1 << w.bitDepth) / 2 - 1
+    ){
+      ctx.font = (w.bitDepth >= 6 ? 24 : 30) + 'px monospace';
+      ctx.fillStyle = '#37f';
+      ctx.fillText('' + label, 24, sy + 3);
+    }
+  }
+
+  // zero
+  if (view.sample === 0 || view.sample === 1){
+    ctx.beginPath();
+    ctx.moveTo(padx, cnv.height / 2);
+    ctx.lineTo(cnv.width - padx, cnv.height / 2);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // bad sinc
+  if (view.sinc === 1){
+    ctx.beginPath();
+    ctx.beginPath();
+    for (var x = 0; x < wsamples.length; x++){
+      var v = wsamples[x];
+      var sx = Math.round(x * cw + padx);
+      var sw = Math.round((x + 1) * cw + padx) - sx;
+      var sh = (-0.5 - v) * (cnv.height - pady * 2) / ((1 << w.bitDepth) - 1);
+      if (x === 0)
+        ctx.moveTo(sx + 0.5 * sw, cnv.height / 2 + sh);
+      else
+        ctx.lineTo(sx + 0.5 * sw, cnv.height / 2 + sh);
+    }
+    ctx.strokeStyle = '#f37';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+
+  // sinc error
+  if (view.sinc === 3){
+    var err = [];
+    for (var x = 0; x < cnv.width - padx * 2; x++){
+      var fx = x * wsamples.length / (cnv.width - padx * 2) - 0.5;
+      var v = 0;
+      for (var s = 0; s < wsamples.length; s++)
+        v += wsamples[s] * sinc(fx - s);
+      var y = (-0.5 - v) * (cnv.height - pady * 2) / ((1 << w.bitDepth) - 1);;
+      err.push(y);
+    }
+    var w2samples = getSamples(1 - waveIndex);
+    for (var x = cnv.width - padx * 2 - 1; x >= 0; x--){
+      var fx = x * w2samples.length / (cnv.width - padx * 2) - 0.5;
+      var v = 0;
+      for (var s = 0; s < w2samples.length; s++)
+        v += w2samples[s] * sinc(fx - s);
+      var y = (-0.5 - v) * (cnv.height - pady * 2) / ((1 << w2.bitDepth) - 1);;
+      err[x] -= y;
+    }
+    ctx.moveTo(padx, cnv.height / 2);
+    for (var x = 0; x < cnv.width - padx * 2; x++)
+      ctx.lineTo(x + padx, cnv.height / 2 + (waveIndex === 0 ? 1 : -1) * err[x]);
+    ctx.lineTo(cnv.width - padx, cnv.height / 2);
+    ctx.fillStyle = '#f73';
+    ctx.fill();
+  }
+
+  // sinc
+  if (view.sinc === 2 || view.sinc === 3){
+    ctx.beginPath();
+    for (var x = 0; x < cnv.width - padx * 2; x++){
+      var fx = x * wsamples.length / (cnv.width - padx * 2) - 0.5;
+      var v = 0;
+      for (var s = 0; s < wsamples.length; s++)
+        v += wsamples[s] * sinc(fx - s);
+      var y = (-0.5 - v) * (cnv.height - pady * 2) / ((1 << w.bitDepth) - 1);;
+      if (x === 0)
+        ctx.moveTo(x + padx, cnv.height / 2 + y);
+      else
+        ctx.lineTo(x + padx, cnv.height / 2 + y);
+    }
+    ctx.strokeStyle = '#ff0';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  // nodes
+  if (view.sample === 1 || view.sample === 2){
+    for (var x = 0; x < wsamples.length; x++){
+      var v = wsamples[x];
+      var sx = Math.round(x * cw + padx);
+      var sw = Math.round((x + 1) * cw + padx) - sx;
+      var sh = (-0.5 - v) * (cnv.height - pady * 2) / ((1 << w.bitDepth) - 1);
+      ctx.beginPath();
+      ctx.arc(sx + 0.5 * sw, cnv.height / 2 + sh, 7.5, 0, Math.PI * 2);
+      ctx.fillStyle = '#ddf';
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 2;
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  ctx.font = '30px monospace';
+  ctx.fillStyle = '#37f';
+  ctx.fillText('256Hz sine wave for 0.01 sec', cnv.width / 2, cnv.height - 50);
+  ctx.fillText('Time -', 120, cnv.height - 50);
+  ctx.fillText('->', 160, cnv.height - 50);
+
+  if (view.sinc === 1){
+    ctx.fillStyle = '#f37';
+    ctx.fillText('Incorrect Interoplation (Linear)', cnv.width / 2, cnv.height - 15);
+  }
+  else if (view.sinc === 2){
+    ctx.fillStyle = '#ff0';
+    ctx.fillText('Correct Interoplation (Sinc)', cnv.width / 2, cnv.height - 15);
+  }
+  else if (view.sinc === 3){
+    ctx.fillStyle = '#f73';
+    ctx.fillText('Wave A - Wave B', cnv.width / 2, cnv.height - 15);
+  }
+
+  ctx.restore();
+}
+
+function mouseMove(e, grab){
+  var w = waves[waveIndex];
+  var padx = 60;
+  var pady = w.bitDepth === 9 ? 99 : 100;
+  var mx = e.offsetX * 2;
+  var my = e.offsetY * 2 + 30;
+  var x = Math.floor((mx - padx) * w.samples.length / (cnv.width - padx * 2));
+  if (x < 0 || x >= w.samples.length)
+    return;
+  var v = Math.min(
+    (1 << (w.bitDepth - 1)) - 1,
+    Math.max(
+      -(1 << (w.bitDepth - 1)),
+      Math.round(-0.5 - (my - cnv.height / 2) * ((1 << w.bitDepth) - 1) / (cnv.height - pady * 2))
+    )
+  );
+  w.samples[x] = v;
+  redraw();
+
+  var cw = (cnv.width - padx * 2) / w.samples.length;
+  var ch = (cnv.height - pady * 2) / ((1 << w.bitDepth) - 1);
+  var sx = Math.round(x * cw + padx);
+  var sw = Math.round((x + 1) * cw + padx) - sx;
+  var sh = (-0.5 - v) * (cnv.height - pady * 2) / ((1 << w.bitDepth) - 1);
+  ctx.beginPath();
+  ctx.arc(sx + 0.5 * sw, cnv.height / 2 + sh, 10, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffd';
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 3;
+  ctx.fill();
+  ctx.stroke();
+}
+
+var down = false;
+cnv.addEventListener('mousedown', function(e){
+  down = true;
+  mouseMove(e, true);
+});
+cnv.addEventListener('mousemove', function(e){
+  if (down)
+    mouseMove(e, false);
+});
+cnv.addEventListener('mouseup', function(e){ down = false; redraw(); });
+cnv.addEventListener('mouseout', function(e){ down = false; redraw(); });
+
+loadWave(0);
+
+</script>
+</body>
+</html>

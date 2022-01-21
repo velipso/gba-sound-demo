@@ -1,0 +1,1959 @@
+//
+// GBA Sound Demo - Rates
+// by Sean Connelly (@velipso), https://sean.cm
+// The Unlicense License
+// Project Home: https://github.com/velipso/gba-sound-demo
+//
+
+.stdlib
+
+.script
+  // this code will generate the 'rates' table below, minus the
+  // 16/32/65kHz rows, just so you can see the math behind it
+  goto skipRatesTable
+  for var i: range 1, 100
+    // bufferSize must be divisible by 16 to align with DMA transfers
+    var bufferSize = i * 16
+    if 280896 % bufferSize == 0
+      // only use buffer sizes that can be emptied at the same rate
+      // that the LCD refreshes (280896 cycles)
+      var cycles = 280896 / bufferSize
+      var rate = 2^24 / cycles
+      say "{0, ${0x10000 - cycles | num.hex 4 | str.lower}}, //",
+        ((rate / 100 | num.round) / 10 | str.pad -4), "kHz"
+    end
+  end
+skipRatesTable:
+  store.set 'rates', {
+    // type, tm0d
+    {0, 0xbb6c}, //  1.0 kHz
+    {0, 0xddb6}, //  1.9 kHz
+    {0, 0xe924}, //  2.9 kHz
+    {0, 0xeedb}, //  3.8 kHz
+    {0, 0xf492}, //  5.7 kHz
+    {0, 0xf634}, //  6.7 kHz
+    {0, 0xf9c4}, // 10.5 kHz
+    {0, 0xfa49}, // 11.5 kHz
+    {0, 0xfb1a}, // 13.4 kHz
+    {1, 0xfc00}, // 16.4 kHz ****
+    {0, 0xfc64}, // 18.2 kHz
+    {0, 0xfcbc}, // 20.1 kHz
+    {0, 0xfce2}, // 21.0 kHz
+    {0, 0xfd8d}, // 26.8 kHz
+    {0, 0xfdec}, // 31.5 kHz
+    {2, 0xfe00}, // 32.8 kHz ****
+    {0, 0xfe32}, // 36.3 kHz
+    {0, 0xfe5e}, // 40.1 kHz
+    {0, 0xfe71}, // 42.0 kHz
+    {0, 0xfecc}, // 54.5 kHz
+    {0, 0xfef6}, // 63.1 kHz
+    {4, 0xff00}, // 65.5 kHz ****
+    {0, 0xff19}, // 72.6 kHz
+    {0, 0xff1c}, // 73.6 kHz
+    {0, 0xff2f}, // 80.3 kHz
+  }
+  put '.def $RATE_COUNT =', &store.get 'rates'
+.end
+
+.struct $G = 0x03004000
+  // 'step' determines how fast we move through the wave sample
+  .s32 step     // = (stepOrig * stepMul) >> 8
+  .s32 stepOrig // step value for 256Hz wave
+  .s32 stepMul  // 24.8 fixed point, use L and R to adjust output freq
+
+  // random number generator state, used for dithering
+  .s32 randIndex
+  .s32 randWord
+
+  // for vblank based sample rates, swapOnVblank is 1 (otherwise 0)
+  // for timer1 based sample rates, fillRequest is 1 on frames where
+  // the buffer should be filled (231 out of every 256 frames)
+  .s32 swapOnVblank
+  .s32 fillRequest
+
+  // UI state
+  .s32 bufferSize
+  .s32 bitDepth
+  .s32 cursor
+  .s32 ang
+  .s32 rate1
+  .s32 bit1
+  .s32 rate2
+  .s32 bit2
+
+  // there are 4 buffers... two for FIFO A, and two for FIFO B
+  // FIFO A is the top 8-bits of the sample
+  // FIFO B is the bottom 1-bit for 9-bit samples (otherwise zero)
+  // the DMAs will alternate between the buffers, and rendering will
+  // happen in the buffer the DMA isn't using
+  .s32 bufferAddrA
+  .s32 bufferAddrA2
+  .s32 bufferAddrB
+  .s32 bufferAddrB2
+  .s8 bufferA1[1344]
+  .s8 bufferA2[1344]
+  .s8 bufferB1[1344]
+  .s8 bufferB2[1344]
+  .s32 _end
+.end
+.if $G._end > 0x03006000
+  .error "Globals too big, running into stack"
+.end
+
+// GBA header
+.begin
+  b @@main
+  .logo
+  .title "GBASND"
+  .i8 "CUNE77"
+  .i16 150, 0, 0, 0, 0
+  .i8 0 // version
+  .crc
+  .i16 0
+@@main:
+.end
+  // set cartridge wait state for faster access
+  ldr   r0, =$REG_WAITCNT
+  ldr   r1, =0x4317
+  strh  r1, [r0]
+
+  // enable display + bg0
+  ldr   r0, =$REG_DISPCNT
+  ldr   r1, =0b0000000100000_000
+  strh  r1, [r0]
+
+  // configure bg0 to start at 0x06000000/0x06004000
+  ldr   r0, =$REG_BG0CNT
+  ldr   r1, =0b00_0_00000_00_00_01_00
+  strh  r1, [r0]
+
+  // slide over slightly
+  ldr   r0, =$REG_BG0HOFS
+  ldr   r1, =16
+  strh  r1, [r0]
+
+  // load tile data
+  ldr   r0, =0x06004000
+  ldr   r1, =@tilesheetStart
+  ldr   r2, =@tilesheetEnd - @tilesheetStart
+  bl    @memcpy32
+
+  // load palette
+  ldr   r0, =0x05000000
+  ldr   r1, =@paletteStart
+  ldr   r2, =@paletteEnd - @paletteStart
+  bl    @memcpy32
+
+  // color bottom half green
+  .begin
+    ldr   r0, =0x06000280
+    ldr   r1, =10 * 32
+    ldr   r2, =0x2000
+@@loop:
+    strh  r2, [r0]
+    adds  r0, #2
+    subs  r1, #1
+    bne   @@loop
+  .end
+
+  // put URL at bottom
+  ldr   r0, =0x060004e8
+  ldr   r1, =@webUrl
+  ldr   r2, =24
+  bl    @memcpy32
+
+  // put indicator in bottom-left corner
+  ldr   r0, =0x060004c4
+  ldr   r1, =0x2084
+  strh  r1, [r0]
+
+  // set rate1 to 32k
+  ldr   r0, =$G.rate1
+  ldr   r1, =15
+  str   r1, [r0]
+
+  // set stepMul to 1.0
+  ldr   r0, =$G.stepMul
+  ldr   r1, =0x100
+  str   r1, [r0]
+
+  // copy over IWRAM program and run it
+  ldr   r0, =0x03000000
+  ldr   r1, =@iwramStart
+  ldr   r2, =@iwramEnd - @iwramStart
+  bl    @memcpy32
+  ldr   r0, =@sndInit
+  bl    @bxr0
+
+@loop:
+  bl    @nextFrame
+
+  // check input
+  .begin
+    ldr   r0, =$REG_KEYINPUT
+    ldrh  r0, [r0]
+    nots  r0, r0
+    ldr   r1, =0x003
+    ands  r1, r0
+    bne   @@hitAB
+    ldr   r1, =0x0c0
+    ands  r1, r0
+    bne   @@hitUpDown
+    ldr   r1, =0x030
+    ands  r1, r0
+    bne   @@hitLeftRight
+    ldr   r1, =0x300
+    ands  r1, r0
+    bne   @@hitLR
+    ldr   r1, =0x008
+    ands  r1, r0
+    bne   @@hitStart
+    ldr   r1, =0x004
+    ands  r1, r0
+    bne   @@hitSelect
+    b     @@doneInput
+@@hitLeftRight:
+    ldr   r0, =$G.cursor
+    ldr   r0, [r0]
+    cmp   r1, #0x10
+    beq   @@hitRight
+    // hit left
+    cmp   r0, #0
+    beq   @@hitLeftRate1
+    cmp   r0, #1
+    beq   @@hitLeftBit1
+    cmp   r0, #2
+    beq   @@hitLeftRate2
+    b     @@hitLeftBit2
+@@hitLeftRate1:
+    ldr   r0, =$G.rate1
+    ldr   r1, [r0]
+    cmp   r1, #0
+    beq   @@waitNoInput
+    sub   r1, #1
+    str   r1, [r0]
+    b     @@update
+@@hitLeftBit1:
+    ldr   r0, =$G.bit1
+    ldr   r1, [r0]
+    cmp   r1, #0
+    beq   @@waitNoInput
+    sub   r1, #1
+    str   r1, [r0]
+    b     @@update
+@@hitLeftRate2:
+    ldr   r0, =$G.rate2
+    ldr   r1, [r0]
+    cmp   r1, #0
+    beq   @@waitNoInput
+    sub   r1, #1
+    str   r1, [r0]
+    b     @@update
+@@hitLeftBit2:
+    ldr   r0, =$G.bit2
+    ldr   r1, [r0]
+    cmp   r1, #0
+    beq   @@waitNoInput
+    sub   r1, #1
+    str   r1, [r0]
+    b     @@update
+@@hitRight:
+    cmp   r0, #0
+    beq   @@hitRightRate1
+    cmp   r0, #1
+    beq   @@hitRightBit1
+    cmp   r0, #2
+    beq   @@hitRightRate2
+    b     @@hitRightBit2
+@@hitRightRate1:
+    ldr   r0, =$G.rate1
+    ldr   r1, [r0]
+    cmp   r1, #$RATE_COUNT - 1
+    beq   @@waitNoInput
+    add   r1, #1
+    str   r1, [r0]
+    b     @@update
+@@hitRightBit1:
+    ldr   r0, =$G.bit1
+    ldr   r1, [r0]
+    cmp   r1, #15
+    beq   @@waitNoInput
+    add   r1, #1
+    str   r1, [r0]
+    b     @@update
+@@hitRightRate2:
+    ldr   r0, =$G.rate2
+    ldr   r1, [r0]
+    cmp   r1, #$RATE_COUNT - 1
+    beq   @@waitNoInput
+    add   r1, #1
+    str   r1, [r0]
+    b     @@update
+@@hitRightBit2:
+    ldr   r0, =$G.bit2
+    ldr   r1, [r0]
+    cmp   r1, #15
+    beq   @@waitNoInput
+    add   r1, #1
+    str   r1, [r0]
+    b     @@update
+@@hitAB:
+    ldr   r0, =$G.cursor
+    ldr   r2, [r0]
+    eor   r2, r2, #2
+    b     @@saveCursor
+@@hitUpDown:
+    ldr   r0, =$G.cursor
+    ldr   r2, [r0]
+    mov   r3, r2, lsr #1
+    cmp   r1, #0x80
+    beq   @@hitDown
+    // hit up
+    cmp   r2, #0
+    beq   @@doneInput
+    subs  r2, #1
+    b     @@saveCursor
+@@hitDown:
+    cmp   r2, #3
+    beq   @@doneInput
+    adds  r2, #1
+@@saveCursor:
+    str   r2, [r0]
+    mov   r0, r2, lsr #1
+    cmp   r0, r3
+    beq   @@waitNoInput
+    b     @@update
+@@hitLR:
+    cmp   r1, #0x100
+    beq   @@hitR
+    // hit L
+    ldr   r0, =$G.stepMul
+    ldr   r1, [r0]
+    mov   r2, r1, lsr #8
+    add   r2, #1
+    sub   r1, r2
+    b     @@updateStep
+@@hitR:
+    ldr   r0, =$G.stepMul
+    ldr   r1, [r0]
+    mov   r2, r1, lsr #8
+    add   r2, #1
+    add   r1, r2
+    b     @@updateStep
+@@hitStart:
+    ldr   r0, =$G.stepMul
+    ldr   r1, =0x100
+    b     @@updateStep
+@@hitSelect:
+    ldr   r0, =$G.stepMul
+    ldr   r1, =0x1000
+    b     @@updateStep
+@@updateStep:
+    ldr   r2, =1
+    cmp   r1, r2
+    blt   @@clampStepMin
+    ldr   r2, =0x8000
+    cmp   r1, r2
+    bgt   @@clampStepMax
+    b     @@writeStep
+@@clampStepMin:
+    ldr   r1, =1
+    b     @@writeStep
+@@clampStepMax:
+    ldr   r1, =0x8000
+@@writeStep:
+    str   r1, [r0]
+    ldr   r0, =$G.stepOrig
+    ldr   r0, [r0]
+    mul   r0, r0, r1
+    mov   r0, r0, lsr #8
+    ldr   r1, =$G.step
+    str   r0, [r1]
+    b     @@doneInput
+@@update:
+    // parameters have changed, so run @sndInit again
+    bl    @writeDisplay
+    ldr   r0, =@sndInit
+    bl    @bxr0
+@@waitNoInput:
+    bl    @nextFrame
+    bl    @writeDisplay
+    ldr   r0, =$REG_KEYINPUT
+    ldrh  r0, [r0]
+    ldr   r1, =0x3ff
+    cmp   r0, r1
+    bne   @@waitNoInput
+@@doneInput:
+  .end
+
+  bl    @writeDisplay
+
+  b     @loop
+  .pool
+
+@bxr0:
+  bx    r0
+@bxr2:
+  bx    r2
+
+@writeDisplay:
+  .begin
+    push  {r4-r5, lr}
+
+    // print cursor
+    .begin
+      ldr   r4, =$G.cursor
+      ldr   r4, [r4]
+
+      // cursor 0
+      ldr   r0, =10
+      ldr   r1, =2
+      cmp   r4, #0
+      beq   @@cursor0
+      ldr   r2, =0x1000
+      b     @@done0
+@@cursor0:
+      ldr   r2, =0x103c
+@@done0:
+      bl    @printChar
+
+      // cursor 1
+      ldr   r0, =10
+      ldr   r1, =6
+      cmp   r4, #1
+      beq   @@cursor1
+      ldr   r2, =0x1000
+      b     @@done1
+@@cursor1:
+      ldr   r2, =0x103c
+@@done1:
+      bl    @printChar
+
+      // cursor 2
+      ldr   r0, =10
+      ldr   r1, =12
+      cmp   r4, #2
+      beq   @@cursor2
+      ldr   r2, =0x3000
+      b     @@done2
+@@cursor2:
+      ldr   r2, =0x303c
+@@done2:
+      bl    @printChar
+
+      // cursor 3
+      ldr   r0, =10
+      ldr   r1, =16
+      cmp   r4, #3
+      beq   @@cursor3
+      ldr   r2, =0x3000
+      b     @@done3
+@@cursor3:
+      ldr   r2, =0x303c
+@@done3:
+      bl    @printChar
+    .end
+
+    // print rate1
+    .begin
+      ldr   r0, =12
+      ldr   r1, =2
+      ldr   r2, =0x0000
+      ldr   r3, =$G.cursor
+      ldr   r3, [r3]
+      cmp   r3, #0
+      bne   @@skipPalette
+      ldr   r2, =0x1000
+@@skipPalette:
+      ldr   r3, =@rateTable
+      ldr   r4, =$G.rate1
+      ldr   r4, [r4]
+      ldr   r5, =12
+      mul   r4, r4, r5
+      add   r3, r4
+      bl    @printRate
+    .end
+
+    // print bit1
+    .begin
+      ldr   r0, =12
+      ldr   r1, =6
+      ldr   r2, =0x0000
+      ldr   r3, =$G.cursor
+      ldr   r3, [r3]
+      cmp   r3, #1
+      bne   @@skipPalette
+      ldr   r2, =0x1000
+@@skipPalette:
+      ldr   r3, =@bitDepthStrings
+      ldr   r4, =$G.bit1
+      ldr   r4, [r4]
+      ldr   r5, =10
+      mul   r4, r4, r5
+      add   r3, r4
+      bl    @printBit
+
+      // dithered text
+      ldr   r0, =0x06000218
+      ldr   r4, =$G.bit1
+      ldr   r4, [r4]
+      ands  r4, #1
+      beq   @@ditherOff
+      ldr   r3, =$G.cursor
+      ldr   r3, [r3]
+      cmp   r3, #1
+      beq   @@ditherSel
+      ldr   r1, =@ditheredText0On
+      b     @@dither
+@@ditherSel:
+      ldr   r1, =@ditheredText0OnSel
+      b     @@dither
+@@ditherOff:
+      ldr   r1, =@ditheredText0Off
+@@dither:
+      ldr   r2, =16
+      bl    @memcpy32
+    .end
+
+    // print rate2
+    .begin
+      ldr   r0, =12
+      ldr   r1, =12
+      ldr   r2, =0x2000
+      ldr   r3, =$G.cursor
+      ldr   r3, [r3]
+      cmp   r3, #2
+      bne   @@skipPalette
+      ldr   r2, =0x3000
+@@skipPalette:
+      ldr   r3, =@rateTable
+      ldr   r4, =$G.rate2
+      ldr   r4, [r4]
+      ldr   r5, =12
+      mul   r4, r4, r5
+      add   r3, r4
+      bl    @printRate
+    .end
+
+    // print bit2
+    .begin
+      ldr   r0, =12
+      ldr   r1, =16
+      ldr   r2, =0x2000
+      ldr   r3, =$G.cursor
+      ldr   r3, [r3]
+      cmp   r3, #3
+      bne   @@skipPalette
+      ldr   r2, =0x3000
+@@skipPalette:
+      ldr   r3, =@bitDepthStrings
+      ldr   r4, =$G.bit2
+      ldr   r4, [r4]
+      ldr   r5, =10
+      mul   r4, r4, r5
+      add   r3, r4
+      bl    @printBit
+
+      // dithered text
+      ldr   r0, =0x06000498
+      ldr   r4, =$G.bit2
+      ldr   r4, [r4]
+      ands  r4, #1
+      beq   @@ditherOff
+      ldr   r3, =$G.cursor
+      ldr   r3, [r3]
+      cmp   r3, #3
+      beq   @@ditherSel
+      ldr   r1, =@ditheredText1On
+      b     @@dither
+@@ditherSel:
+      ldr   r1, =@ditheredText1OnSel
+      b     @@dither
+@@ditherOff:
+      ldr   r1, =@ditheredText1Off
+@@dither:
+      ldr   r2, =16
+      bl    @memcpy32
+    .end
+
+    // print top speaker
+    .begin
+      ldr   r0, =0x06000130
+      ldr   r1, =0x0080
+      ldr   r2, =$G.cursor
+      ldr   r2, [r2]
+      mov   r2, r2, lsr #1
+      cmp   r2, #0
+      bne   @@skipPalette
+      ldr   r1, =0x1080
+@@skipPalette:
+      strh  r1, [r0]
+      add   r0, #2
+      add   r1, #2
+      strh  r1, [r0]
+      add   r0, #0x3e
+      sub   r1, #1
+      strh  r1, [r0]
+      add   r0, #2
+      add   r1, #2
+      strh  r1, [r0]
+    .end
+
+    // print bottom speaker
+    .begin
+      ldr   r0, =0x060003b0
+      ldr   r1, =0x2080
+      ldr   r2, =$G.cursor
+      ldr   r2, [r2]
+      mov   r2, r2, lsr #1
+      cmp   r2, #1
+      bne   @@skipPalette
+      ldr   r1, =0x3080
+@@skipPalette:
+      strh  r1, [r0]
+      add   r0, #2
+      add   r1, #2
+      strh  r1, [r0]
+      add   r0, #0x3e
+      sub   r1, #1
+      strh  r1, [r0]
+      add   r0, #2
+      add   r1, #2
+      strh  r1, [r0]
+    .end
+
+    pop   {r4-r5}
+    pop   {lr}
+    bx    lr
+  .end
+
+@printChar: //(x, y, character)
+  .begin
+    mov   r1, r1, lsl #6
+    mov   r0, r0, lsl #1
+    adds  r1, r0
+    ldr   r0, =0x06000000
+    strh  r2, [r0, r1]
+    adds  r2, #1
+    adds  r1, #64
+    strh  r2, [r0, r1]
+    bx    lr
+    .pool
+  .end
+
+@printRate: //(x, y, palette, rateTextPointer)
+  .begin
+    push  {r4-r8, lr}
+    mov   r4, r0
+    mov   r5, r1
+    mov   r6, r2
+    mov   r7, r3
+    mov   r8, #0 // counter
+@@nextChar:
+    mov   r0, r4
+    mov   r1, r5
+    mov   r2, r6
+    ldrb  r3, [r7]
+    sub   r3, #32
+    add   r2, r2, r3, lsl #1
+    bl    @printChar
+    add   r7, #1
+    add   r4, #1
+    add   r8, #1
+    cmp   r8, #7
+    blt   @@nextChar
+
+    pop   {r4-r8}
+    pop   {lr}
+    bx    lr
+    .pool
+  .end
+
+@printBit: //(x, y, palette, bitTextPointer)
+  .begin
+    push  {r4-r8, lr}
+    mov   r4, r0
+    mov   r5, r1
+    mov   r6, r2
+    mov   r7, r3
+    mov   r8, #0 // counter
+@@nextChar:
+    mov   r0, r4
+    mov   r1, r5
+    mov   r2, r6
+    ldrb  r3, [r7]
+    sub   r3, #32
+    add   r2, r2, r3, lsl #1
+    bl    @printChar
+    add   r7, #1
+    add   r4, #1
+    add   r8, #1
+    cmp   r8, #10
+    blt   @@nextChar
+
+    pop   {r4-r8}
+    pop   {lr}
+    bx    lr
+    .pool
+  .end
+
+@nextFrame:
+  .begin
+    push  {r4-r9, lr}
+    swi   0x050000
+
+    // check if we need to swap buffers
+    .begin
+      // if swapOnVblank, then always swap
+      ldr   r0, =$G.swapOnVblank
+      ldr   r0, [r0]
+      cmp   r0, #0
+      bne   @@swap
+      // otherwise, check fillRequest
+      ldr   r0, =$G.fillRequest
+      ldr   r1, [r0]
+      cmp   r1, #0
+      bne   @@renderWithClear
+      b     @@swapEnd
+@@swap:
+      // prepare to swap out DMAs
+      ldr   r0, =$REG_DMA1CNT_H
+      ldr   r1, =$REG_DMA2CNT_H
+      ldr   r2, =$REG_DMA1SAD
+      ldr   r3, =$REG_DMA2SAD
+      ldr   r4, =0
+      ldr   r5, =0xb640
+      ldr   r6, =$G.bufferAddrA2
+      ldr   r7, [r6]
+      ldr   r8, =$G.bufferAddrB2
+      ldr   r9, [r8]
+
+      // swap out the DMAs
+      // disable DMAs
+      strh  r4, [r0]
+      strh  r4, [r1]
+      // set source
+      str   r7, [r2]
+      str   r9, [r3]
+      // enable DMAs
+      strh  r5, [r0]
+      strh  r5, [r1]
+
+      // swap bufferAddrA/B with bufferAddrA2/B2
+      ldr   r0, =$G.bufferAddrA
+      ldr   r1, [r0]
+      ldr   r2, =$G.bufferAddrB
+      ldr   r3, [r2]
+      str   r7, [r0]
+      str   r9, [r2]
+      str   r1, [r6]
+      str   r3, [r8]
+
+      b     @@render
+
+@@renderWithClear:
+      // clear fillRequest
+      ldr   r1, =0
+      str   r1, [r0]
+@@render:
+      // render into bufferAddrA2/bufferAddrB2
+      ldr   r0, =$G.bufferAddrA2
+      ldr   r0, [r0]
+      ldr   r1, =$G.bufferAddrB2
+      ldr   r1, [r1]
+      ldr   r2, =@renderWave
+      bl    @bxr2
+
+@@swapEnd:
+    .end
+
+    // fade out indicator
+    .begin
+      ldr   r0, =0x05000046
+      ldrh  r1, [r0]
+      cmp   r1, #0
+      beq   @@done
+      mov   r2, r1, lsr #10
+      mov   r3, r1, lsr #5
+      and   r3, r3, #0x1f
+      and   r1, r1, #0x1f
+      cmp   r1, #0
+      beq   @@skip1
+      sub   r1, #1
+@@skip1:
+      cmp   r2, #0
+      beq   @@skip2
+      sub   r2, #1
+@@skip2:
+      cmp   r3, #0
+      beq   @@skip3
+      sub   r3, #1
+@@skip3:
+      orr   r1, r2, lsl #10
+      orr   r1, r3, lsl #5
+      strh  r1, [r0]
+@@done:
+    .end
+
+    pop   {r4-r9}
+    pop   {lr}
+    bx    lr
+  .end
+
+@memcpy32: //(dest, source, byte count)
+  .begin
+    subs  r2, #32
+    blt   @@last32
+    stmfd sp!, {r3-r10}
+@@chunk:
+    ldmia r1!, {r3-r10}
+    stmia r0!, {r3-r10}
+    subs  r2, #32
+    blt   @@done32
+    ldmia r1!, {r3-r10}
+    stmia r0!, {r3-r10}
+    subs  r2, #32
+    blt   @@done32
+    ldmia r1!, {r3-r10}
+    stmia r0!, {r3-r10}
+    subs  r2, #32
+    blt   @@done32
+    ldmia r1!, {r3-r10}
+    stmia r0!, {r3-r10}
+    subs  r2, #32
+    bge   @@chunk
+@@done32:
+    ldmfd sp!, {r3-r10}
+@@last32:
+    adds  r2, #32
+    bxle  lr
+@@last4:
+    subs  r2, #4
+    ldrge r12, [r1], #4
+    strge r12, [r0], #4
+    bgt   @@last4
+    bxeq  lr
+    add   r2, #4
+@@bytecopy:
+    ldrb  r12, [r1], #1
+    ldrb  r12, [r0], #1
+    subs  r2, #1
+    bgt   @@bytecopy
+    bx    lr
+    .pool
+  .end
+
+// IWRAM START ///////////////////////////////////////////////////////
+@iwramStart:
+.begin
+.base 0x03000000
+.arm
+
+@irqNone:
+  .begin
+    mov   r0, #0x04000000
+    ldr   ip, [r0, #0x200]!
+    and   r2, ip, ip, lsr #16
+    strh  r2, [r0, #2]
+    ldr   r3, [r0, #-0x208]
+    orr   r3, r3, r2
+    str   r3, [r0, #-0x208]
+    bx    lr
+    .pool
+  .end
+
+@irqStartTimer:
+  .begin
+    // delay a certain number of cycles to align timer1 with vblank
+    // this can require tuning, depending on a lot of factors, and
+    // was a pain to get exactly right... the indicator will blink
+    // when timer1 and vblank are exactly in alignment
+    push  {lr}
+    ldr   r0, =0x3d27b - 16
+    bl    @cycleDelay
+
+    // set IRQ handler
+    ldr   r0, =0x03007ffc
+    ldr   r1, [#@@irqHopAddr]
+    str   r1, [r0]
+
+    // start timer
+    ldr   r0, =$REG_TM1CNT
+    ldr   r1, =0xc1
+    strh  r1, [r0]
+
+    pop   {lr}
+    b     @irqNone
+@@irqHopAddr:
+    .i32 @irqHop
+    .pool
+  .end
+
+@irqHop:
+  .begin
+    // set IRQ handler
+    ldr   r0, =0x03007ffc
+    ldr   r1, =@irqSwap
+    str   r1, [r0]
+
+    b     @irqNone
+    .pool
+  .end
+
+@irqSwap:
+  .begin
+    // irqNone...
+    mov   r0, #0x04000000
+    ldr   ip, [r0, #0x200]!
+    and   r2, ip, ip, lsr #16
+    strh  r2, [r0, #2]
+    ldr   r3, [r0, #-0x208]
+    orr   r3, r3, r2
+    str   r3, [r0, #-0x208]
+    // but check for timer1
+    ands  r3, r2, #0x10
+    bne   @@swap
+    bx    lr
+
+@@swap:
+    push  {r4-r9}
+
+    // prepare to swap out DMAs
+    ldr   r0, =$REG_DMA1CNT_H
+    ldr   r1, =$REG_DMA2CNT_H
+    ldr   r2, =$REG_DMA1SAD
+    ldr   r3, =$REG_DMA2SAD
+    ldr   r4, =0
+    ldr   r5, =0xb640
+    ldr   r6, =$G.bufferAddrA2
+    ldr   r7, [r6]
+    ldr   r8, =$G.bufferAddrB2
+    ldr   r9, [r8]
+
+    // swap out the DMAs
+    // disable DMAs
+    strh  r4, [r0]
+    strh  r4, [r1]
+    // set source
+    str   r7, [r2]
+    str   r9, [r3]
+    // enable DMAs
+    strh  r5, [r0]
+    strh  r5, [r1]
+
+    // swap bufferAddrA/B with bufferAddrA2/B2
+    ldr   r0, =$G.bufferAddrA
+    ldr   r1, [r0]
+    ldr   r2, =$G.bufferAddrB
+    ldr   r3, [r2]
+    str   r7, [r0]
+    str   r9, [r2]
+    str   r1, [r6]
+    str   r3, [r8]
+
+    // flag fillRequest
+    ldr   r0, =$G.fillRequest
+    ldr   r1, =1
+    str   r1, [r0]
+
+    pop   {r4-r9}
+
+    // check for vblank at same time, and blink indicator
+    and   r2, ip, ip, lsr #16
+    ands  r3, r2, #0x01
+    bxeq  lr
+    // blink indicator
+    ldr   r1, =0x05000046
+    ldr   r2, =rgb(31, 31, 31)
+    strh  r2, [r1]
+    bx    lr
+    .pool
+  .end
+
+@sndInit:
+  .begin
+    push  {r4-r11, lr}
+
+    // blink indicator
+    ldr   r0, =0x05000046
+    ldr   r1, =rgb(31, 31, 31)
+    strh  r1, [r0]
+
+    // load rate index and bit index based on cursor
+    .begin
+      ldr   r0, =$G.cursor
+      ldr   r0, [r0]
+      mov   r0, r0, lsr #1
+      cmp   r0, #0
+      beq   @@cursor0
+      ldr   r1, =$G.rate2
+      ldr   r6, =$G.bit2
+      b     @@cursorDone
+@@cursor0:
+      ldr   r1, =$G.rate1
+      ldr   r6, =$G.bit1
+@@cursorDone:
+      ldr   r1, [r1] // r1 = rate index
+      ldr   r6, [r6] // r6 = bit index
+    .end
+
+    // load type and timer, and store bufferSize and bitDepth
+    .begin
+      ldr   r0, =@rateTable
+      ldr   r2, =12
+      mul   r2, r1, r2
+      add   r0, r2
+      ldrh  r1, [r0, #8]  // r1 = bufferSize
+      ldrh  r5, [r0, #10] // r5 = timer
+      ldr   r2, =$G.bufferSize
+      str   r1, [r2]      // store bufferSize in global
+      ldrb  r4, [r0, #7]  // r4 = type
+      ldr   r0, =$G.bitDepth
+      and   r1, r6, #3
+      str   r1, [r0]      // store bitDepth as number 0 to 3
+    .end
+
+    // calculate step as ((0x10000 - timer) * stepMul) >> 8
+    .begin
+      // stepOrig = 0x10000 - timer
+      ldr   r0, =$G.stepOrig
+      mov   r1, #0x10000
+      sub   r1, r1, r5
+      str   r1, [r0]
+
+      // multiply by stepMul (24.8 fixed point)
+      ldr   r0, =$G.stepMul
+      ldr   r0, [r0]
+      mul   r1, r1, r0
+      mov   r1, r1, lsr #8
+
+      // save to step
+      ldr   r0, =$G.step
+      str   r1, [r0]
+    .end
+
+    // branch based on type
+    cmp   r4, #0
+    beq   @@typeVblank
+    b     @@typeTimer1
+
+    // r4 = type
+    // r5 = timer
+    // r6 = bit index
+
+@@typeVblank:
+    // disable interrupts during setup
+    ldr   r0, =$REG_IME
+    ldr   r1, =0
+    strb  r1, [r0]
+
+    // inform main loop we are swapping on vblank
+    ldr   r0, =$G.swapOnVblank
+    ldr   r1, =1
+    str   r1, [r0]
+
+    // clear fillRequest
+    ldr   r0, =$G.fillRequest
+    ldr   r1, =0
+    str   r1, [r0]
+
+    // setup DISPSTAT
+    ldr   r0, =$REG_DISPSTAT
+    ldr   r1, =8 // enable vblank
+    strh  r1, [r0]
+
+    // setup IE
+    ldr   r0, =$REG_IE
+    ldr   r1, =0x01 // enable vblank
+    strh  r1, [r0]
+
+    // stop timer 0,1
+    ldr   r0, =$REG_TM0CNT
+    ldr   r1, =0
+    strh  r1, [r0]
+    ldr   r0, =$REG_TM1CNT
+    strh  r1, [r0]
+
+    // set IRQ handler
+    ldr   r0, =0x03007ffc
+    ldr   r1, =@irqNone
+    str   r1, [r0]
+
+    // enable interrupts
+    ldr   r0, =$REG_IME
+    ldr   r1, =1
+    strb  r1, [r0]
+
+    // turn sound chip off
+    ldr   r0, =$REG_SOUNDCNT_X
+    ldr   r1, =0x0000
+    strh  r1, [r0]
+
+    // set sound bias
+    .begin
+      ldr   r0, =$REG_SOUNDBIAS
+      ldr   r1, =0x00000200
+      mov   r2, r6, lsr #2
+      mov   r2, r2, lsl #14
+      orr   r1, r1, r2
+      str   r1, [r0]
+    .end
+
+    // turn sound chip on
+    ldr   r0, =$REG_SOUNDCNT_X
+    ldr   r1, =0x0080
+    strh  r1, [r0]
+
+    // set sound to use FIFO A+B
+    .begin
+      ldr   r0, =$REG_SOUNDCNT_H
+      and   r1, r6, #3
+      ands  r1, #2
+      bne   @@nineBit
+      ldr   r1, =0x0b07 // 8-bit, so mute FIFO B
+      b     @@soundCnt
+@@nineBit:
+      ldr   r1, =0xbb07 // 9-bit, so play FIFO B at 50% volume
+@@soundCnt:
+      strh  r1, [r0]
+    .end
+
+    // set DMA1 destination to FIFO A
+    ldr   r0, =$REG_DMA1DAD
+    ldr   r1, =$REG_FIFO_A
+    str   r1, [r0]
+
+    // set DMA2 destination to FIFO B
+    ldr   r0, =$REG_DMA2DAD
+    ldr   r1, =$REG_FIFO_B
+    str   r1, [r0]
+
+    // setup timer 0 delay
+    ldr   r0, =$REG_TM0D
+    strh  r5, [r0]
+
+    // render into buffers twice
+    ldr   r0, =$G.ang
+    ldr   r1, =0
+    str   r1, [r0]
+    ldr   r0, =$G.bufferA1
+    ldr   r1, =$G.bufferB1
+    bl    @renderWave
+    ldr   r0, =$G.bufferA2
+    ldr   r1, =$G.bufferB2
+    bl    @renderWave
+
+    // point DMAs to buffers
+    ldr   r0, =$REG_DMA1SAD
+    ldr   r1, =$G.bufferA1
+    str   r1, [r0]
+    ldr   r0, =$REG_DMA2SAD
+    ldr   r1, =$G.bufferB1
+    str   r1, [r0]
+
+    // enable DMA1+DMA2
+    ldr   r0, =$REG_DMA1CNT_H
+    ldr   r1, =0xb640
+    strh  r1, [r0]
+    ldr   r0, =$REG_DMA2CNT_H
+    strh  r1, [r0]
+
+    // save alt buffers for next render
+    ldr   r0, =$G.bufferAddrA
+    ldr   r1, =$G.bufferA1
+    str   r1, [r0]
+    ldr   r0, =$G.bufferAddrA2
+    ldr   r1, =$G.bufferA2
+    str   r1, [r0]
+    ldr   r0, =$G.bufferAddrB
+    ldr   r1, =$G.bufferB1
+    str   r1, [r0]
+    ldr   r0, =$G.bufferAddrB2
+    ldr   r1, =$G.bufferB2
+    str   r1, [r0]
+
+    // wait until vblank
+    swi   0x050000
+
+    // start timer0
+    ldr   r0, =$REG_TM0CNT
+    ldr   r1, =0x0080
+    strh  r1, [r0]
+
+    b     @@done
+
+@@typeTimer1:
+    // disable interrupts during setup
+    ldr   r0, =$REG_IME
+    ldr   r1, =0
+    strb  r1, [r0]
+
+    // inform main loop we aren't swapping on vblank
+    ldr   r0, =$G.swapOnVblank
+    ldr   r1, =0
+    str   r1, [r0]
+
+    // clear fillRequest
+    ldr   r0, =$G.fillRequest
+    ldr   r1, =0
+    str   r1, [r0]
+
+    // setup DISPSTAT
+    ldr   r0, =$REG_DISPSTAT
+    ldr   r1, =8 // enable vblank
+    strh  r1, [r0]
+
+    // setup IE
+    ldr   r0, =$REG_IE
+    ldr   r1, =0x11 // enable timer1 + vblank
+    strh  r1, [r0]
+
+    // stop timer 0,1
+    ldr   r0, =$REG_TM0CNT
+    ldr   r1, =0
+    strh  r1, [r0]
+    ldr   r0, =$REG_TM1CNT
+    strh  r1, [r0]
+
+    // setup timer1 delay
+    // we want to delay 311296 cycles
+    ldr   r0, =$REG_TM1D
+    ldr   r1, =0xed00
+    strh  r1, [r0]
+
+    // set IRQ handler
+    ldr   r0, =0x03007ffc
+    ldr   r1, =@irqStartTimer
+    str   r1, [r0]
+
+    // enable interrupts
+    ldr   r0, =$REG_IME
+    ldr   r1, =1
+    strb  r1, [r0]
+
+    // turn sound chip off
+    ldr   r0, =$REG_SOUNDCNT_X
+    ldr   r1, =0x0000
+    strh  r1, [r0]
+
+    // set sound bias
+    .begin
+      ldr   r0, =$REG_SOUNDBIAS
+      ldr   r1, =0x00000200
+      mov   r2, r6, lsr #2
+      mov   r2, r2, lsl #14
+      orr   r1, r1, r2
+      str   r1, [r0]
+    .end
+
+    // turn sound chip on
+    ldr   r0, =$REG_SOUNDCNT_X
+    ldr   r1, =0x0080
+    strh  r1, [r0]
+
+    // set sound to use FIFO A+B
+    .begin
+      ldr   r0, =$REG_SOUNDCNT_H
+      and   r1, r6, #3
+      ands  r1, #2
+      bne   @@nineBit
+      ldr   r1, =0x0b07 // 8-bit, so mute FIFO B
+      b     @@soundCnt
+@@nineBit:
+      ldr   r1, =0xbb07 // 9-bit, so play FIFO B at 50% volume
+@@soundCnt:
+      strh  r1, [r0]
+    .end
+
+    // set DMA1 destination to FIFO A
+    ldr   r0, =$REG_DMA1DAD
+    ldr   r1, =$REG_FIFO_A
+    str   r1, [r0]
+
+    // set DMA2 destination to FIFO B
+    ldr   r0, =$REG_DMA2DAD
+    ldr   r1, =$REG_FIFO_B
+    str   r1, [r0]
+
+    // setup timer 0 delay
+    ldr   r0, =$REG_TM0D
+    strh  r5, [r0]
+
+    // render into buffers twice
+    ldr   r0, =$G.ang
+    ldr   r1, =0
+    str   r1, [r0]
+    ldr   r0, =$G.bufferA1
+    ldr   r1, =$G.bufferB1
+    bl    @renderWave
+    ldr   r0, =$G.bufferA2
+    ldr   r1, =$G.bufferB2
+    bl    @renderWave
+
+    // point DMAs to buffers
+    ldr   r0, =$REG_DMA1SAD
+    ldr   r1, =$G.bufferA1
+    str   r1, [r0]
+    ldr   r0, =$REG_DMA2SAD
+    ldr   r1, =$G.bufferB1
+    str   r1, [r0]
+
+    // enable DMA1+DMA2
+    ldr   r0, =$REG_DMA1CNT_H
+    ldr   r1, =0xb640
+    strh  r1, [r0]
+    ldr   r0, =$REG_DMA2CNT_H
+    strh  r1, [r0]
+
+    // save alt buffers for next render
+    ldr   r0, =$G.bufferAddrA
+    ldr   r1, =$G.bufferA1
+    str   r1, [r0]
+    ldr   r0, =$G.bufferAddrA2
+    ldr   r1, =$G.bufferA2
+    str   r1, [r0]
+    ldr   r0, =$G.bufferAddrB
+    ldr   r1, =$G.bufferB1
+    str   r1, [r0]
+    ldr   r0, =$G.bufferAddrB2
+    ldr   r1, =$G.bufferB2
+    str   r1, [r0]
+
+    // wait for vblank to fire (irqStartTimer)
+    swi   0x020000
+
+    // wait for vblank again (irqHop)
+    swi   0x020000
+
+    // start timer0
+    ldr   r0, =$REG_TM0CNT
+    ldr   r1, =0x0080
+    strh  r1, [r0]
+
+    b     @@done
+
+@@done:
+    pop   {r4-r11}
+    pop   {lr}
+    bx    lr
+    .pool
+  .end
+
+@cycleDelay: //(cyclesToWait)
+  // minimum 17 cycle wait, must be in IWRAM, should be called via:
+  //   ...A...
+  //   mov   r0, rX           \__ inserts exactly r0 cycles
+  //   bl    @cycleDelay      /   (including mov and bl)
+  //   ...B...
+  // if the delay can be stored as a mov instruction, it will work
+  //   ...A...
+  //   mov   r0, #0x100       \__ inserts delay of 0x100 cycles
+  //   bl    @cycleDelay      /
+  //   ...B...
+  // but if you need a PC-relative load, then subtract 2 more cycles
+  // to do the load
+  //   ...A...
+  //   ldr   r0, =0x101       \__ inserts delay of 0x103 cycles due
+  //   bl    @cycleDelay      /   to PC relative load
+  //   ...B...
+  .begin
+    ldr   r2, =@@waitSmall
+    sub   r0, #17
+    and   r1, r0, #7
+    sub   r2, r2, r1, lsl #2
+    movs  r0, r0, lsr #3
+@@waitBig:
+    bxeq  r2
+    nop
+    nop
+    nop
+    subs  r0, #1
+    b     @@waitBig
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+@@waitSmall:
+    bx    lr
+    .pool
+  .end
+
+@randByte: // returns random byte in r0
+  .begin
+    ldr   r0, =$G.randIndex
+    ldr   r0, [r0]
+    ands  r3, r0, #3
+    bne   @@nextByte
+
+    // whisky1 with randIndex every 4 requests
+    // see: https://github.com/velipso/whisky
+    ldr   r1, =1831267127
+    mul   r2, r0, r1
+    ldr   r1, =3915839201
+    eor   r0, r2, r0
+    mul   r2, r0, r1
+    ldr   r1, =1561867961
+    eor   r0, r2, r0, lsr #20
+    mul   r3, r0, r1
+    eor   r0, r3, r2, lsr #24
+    ldr   r1, =$G.randWord
+    str   r0, [r1]
+
+@@nextByte:
+    // shift lowest byte from randWord
+    ldr   r2, =$G.randWord
+    ldr   r1, [r2]
+    and   r0, r1, #0xff
+    mov   r1, r1, lsr #8
+    str   r1, [r2]
+
+    // increment randIndex
+    ldr   r2, =$G.randIndex
+    ldr   r1, [r2]
+    add   r1, #1
+    str   r1, [r2]
+
+    bx    lr
+  .end
+
+@renderWave: //(buffer8bit, buffer1bit)
+  .begin
+    push  {r4-r11, lr}
+    ldr   r2, =$G.bufferSize
+    ldr   r2, [r2]
+    ldr   r3, =$G.step
+    ldr   r3, [r3]
+    ldr   r4, =$G.ang
+    ldr   r4, [r4]
+    ldr   r5, =0xffff
+    ldr   r6, =@wave
+    ldr   r9, =$G.bitDepth
+    ldr   r9, [r9]
+
+    and   r9, r9, #3
+    cmp   r9, #0
+    beq   @@next8Trunc
+    cmp   r9, #1
+    beq   @@next8Dith
+    cmp   r9, #2
+    beq   @@next9Trunc
+    b     @@next9Dith
+
+    // since the trunc versions are faster than dithering, it seems to
+    // dampen the 59.7hz signal in the sound, which I imagine is due
+    // to less power usage affecting the output (??)
+@@next8Trunc:
+    .begin
+      // read 16-bit sample
+      mov   r7, r4, lsl #1
+      ldrsh r7, [r6, r7]
+
+      mov   r8, r7, asr #8
+      mov   r7, #0
+
+      strb  r8, [r0] // FIFO A
+      strb  r7, [r1] // FIFO B
+
+      add   r4, r3
+      and   r4, r5
+      add   r0, #1
+      add   r1, #1
+      subs  r2, #1
+    .end
+    bne   @@next8Trunc
+    b     @@done
+
+@@next8Dith:
+    .begin
+      // get random byte in r10
+      push  {r0-r3}
+      bl    @randByte
+      mov   r10, r0
+      pop   {r0-r3}
+
+      // read 16-bit sample
+      mov   r7, r4, lsl #1
+      ldrsh r7, [r6, r7]
+
+      // split into sample + fractional part
+      mov   r8, r7, asr #8
+      and   r9, r7, #0xff
+
+      // compare fractional part to random number
+      cmp   r9, r10
+      blt   @@ditherDone
+      // round up sample (but don't exceed 0x7f)
+      cmp   r8, #0x7f
+      bge   @@ditherDone
+      add   r8, #1
+@@ditherDone:
+      mov   r7, #0
+
+      strb  r8, [r0] // FIFO A
+      strb  r7, [r1] // FIFO B
+
+      add   r4, r3
+      and   r4, r5
+      add   r0, #1
+      add   r1, #1
+      subs  r2, #1
+    .end
+    bne   @@next8Dith
+    b     @@done
+
+@@next9Trunc:
+    .begin
+      // read 16-bit sample
+      mov   r7, r4, lsl #1
+      ldrsh r7, [r6, r7]
+
+      mov   r8, r7, asr #8
+      mov   r7, r7, asr #7
+      and   r7, r7, #1
+
+      strb  r8, [r0] // FIFO A
+      strb  r7, [r1] // FIFO B
+
+      add   r4, r3
+      and   r4, r5
+      add   r0, #1
+      add   r1, #1
+      subs  r2, #1
+    .end
+    bne   @@next9Trunc
+    b     @@done
+
+@@next9Dith:
+    .begin
+      // get random byte (0-0x7f) in r10
+      push  {r0-r3}
+      bl    @randByte
+      and   r10, r0, #0x7f
+      pop   {r0-r3}
+
+      // read 16-bit sample
+      mov   r7, r4, lsl #1
+      ldrsh r7, [r6, r7]
+
+      // split into sample + fractional part
+      mov   r8, r7, asr #7
+      and   r9, r7, #0x7f
+
+      // compare fractional part to random number
+      cmp   r9, r10
+      blt   @@ditherDone
+      // round up sample (but don't exceed 0xff)
+      cmp   r8, #0xff
+      bge   @@ditherDone
+      add   r8, #1
+@@ditherDone:
+      // r7 gets lowest bit
+      and   r7, r8, #1
+      mov   r8, r8, asr #1
+
+      strb  r8, [r0] // FIFO A
+      strb  r7, [r1] // FIFO B
+
+      add   r4, r3
+      and   r4, r5
+      add   r0, #1
+      add   r1, #1
+      subs  r2, #1
+    .end
+    bne   @@next9Dith
+    b     @@done
+
+@@done:
+    ldr   r0, =$G.ang
+    str   r4, [r0]
+    pop   {r4-r11}
+    pop   {lr}
+    bx    lr
+    .pool
+  .end
+
+// IWRAM END /////////////////////////////////////////////////////////
+.end
+.align 4
+@iwramEnd:
+
+  .align 4
+@wave:
+  .script
+    // 65536 16-bit samples of entire sine wave, played at one cycle
+    // per sample, creates 256hz tone
+    for var i: range 65536
+      put ".i16 ${num.round 0x7fff * num.sin i * num.pi * 2 / 65536}"
+    end
+  .end
+
+  .align 4
+@rateTable:
+  .script
+    for var row: store.get 'rates'
+      var {type, timer} = row
+      var rate = "${num.round 2^24 / (0x10000 - timer)}K" | str.pad 6
+      var bufferSize, tail
+      if type == 0
+        bufferSize = 280896 / (0x10000 - timer)
+        tail = ' '
+      else
+        // bufferSize is 304 for 16k, 608 for 32k, 1216 for 65k
+        bufferSize = 304 * type
+        tail = '*'
+      end
+      put ".i8 \"$rate$tail\""
+      put ".i8 $type"
+      put ".i16 $bufferSize"
+      put ".i16 $timer"
+    end
+  .end
+
+@bitDepthStrings:
+  .i8 "8-BIT 32K "
+  .i8 "8-BIT 32K "
+  .i8 "9-BIT 32K "
+  .i8 "9-BIT 32K "
+  .i8 "8-BIT 65K "
+  .i8 "8-BIT 65K "
+  .i8 "9-BIT 65K "
+  .i8 "9-BIT 65K "
+  .i8 "8-BIT 131K"
+  .i8 "8-BIT 131K"
+  .i8 "9-BIT 131K"
+  .i8 "9-BIT 131K"
+  .i8 "8-BIT 262K"
+  .i8 "8-BIT 262K"
+  .i8 "9-BIT 262K"
+  .i8 "9-BIT 262K"
+
+@webUrl:
+  .i16 0x2000, 0x2086, 0x2086, 0x2086, 0x2087, 0x2088, 0x2089, 0x208a
+  .i16 0x208b, 0x2087, 0x208c, 0x208d
+@ditheredText0Off:
+  .i16 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+@ditheredText0On:
+  .i16 0x008e, 0x008f, 0x0090, 0x0091, 0x0089, 0x0092, 0x0089, 0x008e
+@ditheredText0OnSel:
+  .i16 0x108e, 0x108f, 0x1090, 0x1091, 0x1089, 0x1092, 0x1089, 0x108e
+@ditheredText1Off:
+  .i16 0x2000, 0x2000, 0x2000, 0x2000, 0x2000, 0x2000, 0x2000, 0x2000
+@ditheredText1On:
+  .i16 0x208e, 0x208f, 0x2090, 0x2091, 0x2089, 0x2092, 0x2089, 0x208e
+@ditheredText1OnSel:
+  .i16 0x308e, 0x308f, 0x3090, 0x3091, 0x3089, 0x3092, 0x3089, 0x308e
+
+  .align 4
+@paletteStart:
+  .i16 0, rgb(15, 15, 31), rgb(0, 0, 20)
+  .i16 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  .i16 0, rgb(15, 15, 31), rgb(31, 31, 31)
+  .i16 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  .i16 0, rgb(0, 25, 0), rgb(0, 15, 0)
+  .i16 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  .i16 0, rgb(0, 25, 0), rgb(31, 31, 31)
+  .i16 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+@paletteEnd:
+
+  .align 4
+@tilesheetStart:
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111 // space
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11122111 // !
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // "
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // #
+  .i32 0x22222222, 0x22222222, 0x12211221, 0x12211221
+  .i32 0x22222222, 0x22222222, 0x12211221, 0x12211221
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11122111, 0x11122111, 0x12222211, 0x12222221 // $
+  .i32 0x11111221, 0x11111221, 0x11222221, 0x12222211
+  .i32 0x12211111, 0x12211111, 0x12222221, 0x11222221
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // %
+  .i32 0x11221221, 0x11221111, 0x11122111, 0x11122111
+  .i32 0x11112211, 0x12212211, 0x12211221, 0x12211221
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11122211, 0x11222221, 0x11221221, 0x11221221 // &
+  .i32 0x11122211, 0x11122211, 0x11112221, 0x11112221
+  .i32 0x12222122, 0x12222122, 0x11221122, 0x11221122
+  .i32 0x12222222, 0x12212221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11122111 // '
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211111, 0x11221111 // (
+  .i32 0x11222111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11222111
+  .i32 0x11221111, 0x12211111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111221, 0x11112211 // )
+  .i32 0x11122211, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122211
+  .i32 0x11112211, 0x11111221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // *
+  .i32 0x11222211, 0x11222211, 0x22222222, 0x22222222
+  .i32 0x11222211, 0x11222211, 0x12211221, 0x12211221
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11122111 // +
+  .i32 0x11122111, 0x11122111, 0x12222221, 0x12222221
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111 // ,
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11112211, 0x11111211
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111 // -
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111 // .
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211111, 0x12211111 // forward slash
+  .i32 0x12211111, 0x11221111, 0x11221111, 0x11122111
+  .i32 0x11122111, 0x11112211, 0x11112211, 0x11111221
+  .i32 0x11111221, 0x11111221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11222211 // 0
+  .i32 0x12212221, 0x12211221, 0x12221221, 0x12222221
+  .i32 0x12222221, 0x12212221, 0x12211221, 0x12221221
+  .i32 0x11222211, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11122111 // 1
+  .i32 0x11122211, 0x11122211, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x12222221, 0x12222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x12222221 // 2
+  .i32 0x12211221, 0x12211221, 0x11221111, 0x11221111
+  .i32 0x11122111, 0x11122111, 0x11112211, 0x11112211
+  .i32 0x12222221, 0x12222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221 // 3
+  .i32 0x11221111, 0x11221111, 0x11122111, 0x11122111
+  .i32 0x11221111, 0x11221111, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11221111, 0x11221111 // 4
+  .i32 0x11222111, 0x11222111, 0x11222211, 0x11222211
+  .i32 0x11221221, 0x11221221, 0x12222221, 0x12222221
+  .i32 0x11221111, 0x11221111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221 // 5
+  .i32 0x11111221, 0x11111221, 0x11222221, 0x12222221
+  .i32 0x12211111, 0x12211111, 0x12211111, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222111, 0x11222211 // 6
+  .i32 0x11112221, 0x11111221, 0x11111221, 0x11222221
+  .i32 0x12222221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221 // 7
+  .i32 0x12211111, 0x12211111, 0x11221111, 0x11221111
+  .i32 0x11122111, 0x11122111, 0x11112211, 0x11112211
+  .i32 0x11112211, 0x11112211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x12222221 // 8
+  .i32 0x12211221, 0x12211221, 0x11222211, 0x11222211
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x12222221 // 9
+  .i32 0x12211221, 0x12211221, 0x12222221, 0x12222211
+  .i32 0x12211111, 0x12211111, 0x12211111, 0x12221111
+  .i32 0x11222211, 0x11122211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111 // :
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111 // ;
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11112211, 0x11111211
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x12221111 // <
+  .i32 0x11222111, 0x11122211, 0x11112221, 0x11111222
+  .i32 0x11112221, 0x11122211, 0x11222111, 0x12221111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111 // =
+  .i32 0x12222221, 0x12222221, 0x11111111, 0x11111111
+  .i32 0x12222221, 0x12222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111222 // >
+  .i32 0x11112221, 0x11122211, 0x11222111, 0x12221111
+  .i32 0x11222111, 0x11122211, 0x11112221, 0x11111222
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x12222221 // ?
+  .i32 0x12211221, 0x12211221, 0x11221111, 0x11221111
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11111111
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122211, 0x11222221 // @
+  .i32 0x12211222, 0x12111122, 0x12122122, 0x12212122
+  .i32 0x12212122, 0x11222122, 0x11111122, 0x12111222
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122111, 0x11222211 // A
+  .i32 0x12222221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x12222221, 0x12211221, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222221, 0x12222221 // B
+  .i32 0x12211221, 0x11221221, 0x11122221, 0x11222221
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x12222221 // C
+  .i32 0x12211221, 0x12211221, 0x11111221, 0x11111221
+  .i32 0x11111221, 0x11111221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122221, 0x11222221 // D
+  .i32 0x12221221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12221221
+  .i32 0x11222221, 0x11122221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221 // E
+  .i32 0x11111221, 0x11111221, 0x11222221, 0x11222221
+  .i32 0x11111221, 0x11111221, 0x11111221, 0x11111221
+  .i32 0x12222221, 0x12222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221 // F
+  .i32 0x11111221, 0x11111221, 0x11222221, 0x11222221
+  .i32 0x11111221, 0x11111221, 0x11111221, 0x11111221
+  .i32 0x11111221, 0x11111221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222211, 0x12222221 // G
+  .i32 0x11111221, 0x11111221, 0x12221221, 0x12221221
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // H
+  .i32 0x12211221, 0x12211221, 0x12222221, 0x12222221
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221 // I
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x12222221, 0x12222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211111, 0x12211111 // J
+  .i32 0x12211111, 0x12211111, 0x12211111, 0x12211111
+  .i32 0x12211111, 0x12211111, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11221122, 0x11221122 // K
+  .i32 0x11122122, 0x11122122, 0x11112222, 0x11112222
+  .i32 0x11122122, 0x11122122, 0x11221122, 0x11221122
+  .i32 0x12211122, 0x12211122, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111221, 0x11111221 // L
+  .i32 0x11111221, 0x11111221, 0x11111221, 0x11111221
+  .i32 0x11111221, 0x11111221, 0x11111221, 0x11111221
+  .i32 0x12222221, 0x12222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211122, 0x12211122 // M
+  .i32 0x12221222, 0x12221222, 0x12222222, 0x12212122
+  .i32 0x12212122, 0x12211122, 0x12211122, 0x12211122
+  .i32 0x12211122, 0x12211122, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // N
+  .i32 0x12211221, 0x12212221, 0x12212221, 0x12222221
+  .i32 0x12222221, 0x12221221, 0x12221221, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x12222221 // O
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222221, 0x12222221 // P
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222221, 0x11111221, 0x11111221
+  .i32 0x11111221, 0x11111221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x12222221 // Q
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12121221
+  .i32 0x11222221, 0x12212211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122222, 0x11222222 // R
+  .i32 0x11221122, 0x11221122, 0x11221122, 0x11222222
+  .i32 0x11122222, 0x11122122, 0x11221122, 0x11221122
+  .i32 0x12211122, 0x12211122, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222211, 0x12222221 // S
+  .i32 0x11111221, 0x11111221, 0x11112221, 0x11122211
+  .i32 0x11222111, 0x12221111, 0x12211111, 0x12211111
+  .i32 0x12222221, 0x11222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221 // T
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // U
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12222221, 0x11222211, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // V
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x11222211, 0x11222211
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211122, 0x12211122 // W
+  .i32 0x12211122, 0x12211122, 0x12211122, 0x12212122
+  .i32 0x12212122, 0x12222222, 0x12222222, 0x12221222
+  .i32 0x12211122, 0x12111112, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // X
+  .i32 0x12211221, 0x11222211, 0x11222211, 0x11122111
+  .i32 0x11122111, 0x11222211, 0x11222211, 0x12211221
+  .i32 0x12211221, 0x12211221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211221, 0x12211221 // Y
+  .i32 0x12211221, 0x12211221, 0x11222211, 0x11222211
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222221, 0x12222221 // Z
+  .i32 0x11221111, 0x11221111, 0x11122111, 0x11122111
+  .i32 0x11112211, 0x11112211, 0x11111221, 0x11111221
+  .i32 0x12222221, 0x12222221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12222111, 0x12222111 // [
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x12222111, 0x12222111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111221, 0x11111221 // backslash
+  .i32 0x11111221, 0x11112211, 0x11112211, 0x11122111
+  .i32 0x11122111, 0x11221111, 0x11221111, 0x12211111
+  .i32 0x12211111, 0x12211111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122221, 0x11122221 // ]
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11122111
+  .i32 0x11122221, 0x11122221, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11112111, 0x11112111, 0x11122211 // ^
+  .i32 0x11122211, 0x11221221, 0x11221221, 0x12211122
+  .i32 0x12211122, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x22222222, 0x22222222, 0x22222222, 0x22222222 // solid
+  .i32 0x22222222, 0x22222222, 0x22222222, 0x22222222
+  .i32 0x22222222, 0x22222222, 0x22222222, 0x22222222
+  .i32 0x22222222, 0x22222222, 0x22222222, 0x22222222
+  .i32 0x11111111, 0x21111111, 0x22111111, 0x22211111 // speaker
+  .i32 0x22221111, 0x22222222, 0x22222222, 0x22222222
+  .i32 0x22222222, 0x22222222, 0x22221111, 0x22211111
+  .i32 0x22111111, 0x21111111, 0x11111111, 0x11111111
+  .i32 0x11112111, 0x11122111, 0x11221111, 0x12211121 // sound waves
+  .i32 0x22111221, 0x22112211, 0x22112211, 0x22112211
+  .i32 0x22112211, 0x22112211, 0x22111221, 0x12211121
+  .i32 0x11221111, 0x11122111, 0x11112111, 0x11111111
+  .i32 0x11111111, 0x11133111, 0x11333311, 0x13333331 // indicator
+  .i32 0x13333331, 0x11333311, 0x11133111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x12211122, 0x12211122 // w
+  .i32 0x12212122, 0x12222222, 0x11221221, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11111111, 0x11111111 // .
+  .i32 0x11111111, 0x11112211, 0x11112211, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x11111221 // s
+  .i32 0x11122211, 0x11221111, 0x11122221, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122211, 0x11221221 // e
+  .i32 0x11222221, 0x11111221, 0x11222211, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122211, 0x11221111 // a
+  .i32 0x11222211, 0x11221221, 0x12222211, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222122, 0x12212221 // n
+  .i32 0x12211221, 0x12211221, 0x12211221, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11222211, 0x11211221 // c
+  .i32 0x11111221, 0x11211221, 0x11222211, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11221222, 0x12222222 // m
+  .i32 0x12212122, 0x12212122, 0x12211122, 0x11111111
+  .i32 0x11222111, 0x11221111, 0x11222211, 0x11221221 // d
+  .i32 0x11221221, 0x11221221, 0x12222211, 0x11111111
+  .i32 0x11111111, 0x11122111, 0x11111111, 0x11122111 // i
+  .i32 0x11122111, 0x11122111, 0x11122111, 0x11111111
+  .i32 0x11112111, 0x11112211, 0x11222221, 0x11112211 // t
+  .i32 0x11112211, 0x11112211, 0x11122111, 0x11111111
+  .i32 0x11112221, 0x11112211, 0x11222211, 0x12212211 // h
+  .i32 0x12212211, 0x12212211, 0x12212221, 0x11111111
+  .i32 0x11111111, 0x11111111, 0x11122221, 0x11221221 // r
+  .i32 0x11111221, 0x11111221, 0x11111221, 0x11111111
+@tilesheetEnd:
+
+.align 0x00100000
