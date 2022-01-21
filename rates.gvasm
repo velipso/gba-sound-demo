@@ -7,6 +7,10 @@
 
 .stdlib
 
+// uncomment this line to verify that 9-Bit audio will be audible
+// it will silence the high 8-Bits, so you can hear the low 1-Bit
+//.def $VERIFY_9BIT = 1
+
 .script
   // this code will generate the 'rates' table below, minus the
   // 16/32/65kHz rows, just so you can see the math behind it
@@ -1514,6 +1518,10 @@ skipRatesTable:
       mov   r7, r7, asr #7
       and   r7, r7, #1
 
+.if defined($VERIFY_9BIT)
+      mov   r8, #0
+.end
+
       strb  r8, [r0] // FIFO A
       strb  r7, [r1] // FIFO B
 
@@ -1553,6 +1561,10 @@ skipRatesTable:
       // r7 gets lowest bit
       and   r7, r8, #1
       mov   r8, r8, asr #1
+
+.if defined($VERIFY_9BIT)
+      mov   r8, #0
+.end
 
       strb  r8, [r0] // FIFO A
       strb  r7, [r1] // FIFO B
