@@ -1,7 +1,7 @@
 GBA Sound Demo
 ==============
 
-These demos allow you to experiment with different sample rates and bit depths on the Gameboy
+These demos allow you to experiment with different sample rates and bit depths on the Game Boy
 Advance.
 
 The GBA is notorious for having bad sound.  Using these demos, you can verify that the GBA hardware
