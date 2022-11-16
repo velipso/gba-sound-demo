@@ -61,12 +61,12 @@ Controls:
 How to Build
 ------------
 
-You will need [gvasm](https://github.com/velipso/gvasm) to assemble the .gvasm files into .gba
-files.
+You will need [gvasm v1](https://github.com/velipso/gvasm#installing-older-version) to assemble the
+.gvasm files into .gba files.
 
 After install gvasm, run:
 
-```
+```bash
 gvasm make rates.gvasm
 ```
 
@@ -80,14 +80,14 @@ Here's what I did:
 
 3. Downloaded the Super Mario 3 Medley:
 
-```
+```bash
 youtube-dl -x --audio-format wav -o song.temp --prefer-ffmpeg \
   'https://www.youtube.com/watch?v=5Nu6BxCnyE0'
 ```
 
 4. Convert it to 13K/8-Bit and 32K/8-Bit:
 
-```
+```bash
 sox song.wav -r 13379 -b 8 -c 1 song-A.wav
 sox song.wav -r 13379 -b 8 -c 1 song-A.raw
 sox song.wav -r 32768 -b 8 -c 1 song-B.wav
@@ -96,6 +96,6 @@ sox song.wav -r 32768 -b 8 -c 1 song-B.raw
 
 5. Build the .gba file:
 
-```
+```bash
 gvasm make song.gvasm
 ```
